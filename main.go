@@ -124,20 +124,20 @@ func checkAll(config Config) []Alert {
 	// MySQL checks
 	db, err := sql.Open("mysql", config.MySQLDSN)
 	if err != nil {
-		alerts = append(alerts, Alert{Message: "**MySQL Connection Failed:** " + err.Error()})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Connection Failed:** %s", sanitizeMarkdown(err.Error()))})
 		return alerts
 	}
 	defer db.Close()
 
 	// Check if running
 	if err := db.Ping(); err != nil {
-		alerts = append(alerts, Alert{Message: "**MySQL Not Running:** " + err.Error()})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Not Running:** %s", sanitizeMarkdown(err.Error()))})
 	}
 
 	// Check slave status
 	slaveStatus, err := checkSlaveStatus(db)
 	if err == nil && (slaveStatus["Slave_IO_Running"] != "Yes" || slaveStatus["Slave_SQL_Running"] != "Yes") {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Slave Abnormal:** IO: %s, SQL: %s", slaveStatus["Slave_IO_Running"], slaveStatus["Slave_SQL_Running"])})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Slave Abnormal:** IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))})
 	}
 
 	// Check deadlocks
@@ -271,12 +271,24 @@ func checkSlowQueries(db *sql.DB) (int, error) {
 	return slowQueries, nil
 }
 
+// sanitizeMarkdown escapes special Markdown characters to prevent parsing errors
+func sanitizeMarkdown(s string) string {
+	specialChars := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
+	for _, char := range specialChars {
+		s = strings.ReplaceAll(s, char, "\\"+char)
+	}
+	return s
+}
+
 func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
 	var sb strings.Builder
 	sb.WriteString("**System Alert**\n\n")
 	for _, alert := range alerts {
 		sb.WriteString(alert.Message + "\n")
 	}
+
+	// Log the message for debugging
+	log.Printf("Sending Telegram message: %s", sb.String())
 
 	type TelegramMessage struct {
 		ChatID    string `json:"chat_id"`
@@ -290,7 +302,12 @@ func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
 		ParseMode: "Markdown",
 	}
 
-	body, _ := json.Marshal(msg)
+	body, err := json.Marshal(msg)
+	if err != nil {
+		log.Printf("Failed to marshal Telegram message: %v", err)
+		return
+	}
+
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramToken)
 	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
