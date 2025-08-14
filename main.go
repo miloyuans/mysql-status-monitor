@@ -149,7 +149,15 @@ func checkAll(config Config) []Alert {
 	// Check slow queries
 	slowQueries, err := checkSlowQueries(db)
 	if err == nil && slowQueries > config.SlowQueryThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Slow Queries:** %d (threshold: %d)", slowQueries, config.SlowQueryThreshold)})
+		alertMsg := fmt.Sprintf("**MySQL Slow Queries:** %d (threshold: %d)", slowQueries, config.SlowQueryThreshold)
+		topSlowSQLs, err := getTopSlowQueries(db)
+		if err == nil && len(topSlowSQLs) > 0 {
+			alertMsg += "\nTop 3 Slowest SQL:\n"
+			for i, sql := range topSlowSQLs {
+				alertMsg += fmt.Sprintf("%d. %s\n", i+1, sanitizeMarkdown(sql))
+			}
+		}
+		alerts = append(alerts, Alert{Message: alertMsg})
 	}
 
 	return alerts
@@ -181,7 +189,10 @@ func getNetIO() (uint64, error) {
 	}
 	if len(ioCounters) > 0 {
 		time.Sleep(time.Second)
-		ioCounters2, _ := net.IOCounters(false)
+		ioCounters2, err := net.IOCounters(false)
+		if err != nil {
+			return 0, err
+		}
 		return (ioCounters2[0].BytesSent + ioCounters2[0].BytesRecv) - (ioCounters[0].BytesSent + ioCounters[0].BytesRecv), nil
 	}
 	return 0, fmt.Errorf("no net data")
@@ -198,7 +209,10 @@ func getDiskIO() (uint64, error) {
 		totalWrite += io.WriteBytes
 	}
 	time.Sleep(time.Second)
-	ioCounters2, _ := disk.IOCounters()
+	ioCounters2, err := disk.IOCounters()
+	if err != nil {
+		return 0, err
+	}
 	var totalRead2, totalWrite2 uint64
 	for _, io := range ioCounters2 {
 		totalRead2 += io.ReadBytes
@@ -271,6 +285,25 @@ func checkSlowQueries(db *sql.DB) (int, error) {
 	return slowQueries, nil
 }
 
+func getTopSlowQueries(db *sql.DB) ([]string, error) {
+	rows, err := db.Query("SELECT sql_text, query_time FROM mysql.slow_log ORDER BY query_time DESC LIMIT 3")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var topSQLs []string
+	for rows.Next() {
+		var sqlText string
+		var queryTime float64
+		if err := rows.Scan(&sqlText, &queryTime); err != nil {
+			return nil, err
+		}
+		topSQLs = append(topSQLs, fmt.Sprintf("SQL: %s, Time: %.2fs", sqlText, queryTime))
+	}
+	return topSQLs, rows.Err()
+}
+
 // sanitizeMarkdown escapes special Markdown characters to prevent parsing errors
 func sanitizeMarkdown(s string) string {
 	specialChars := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
@@ -281,13 +314,22 @@ func sanitizeMarkdown(s string) string {
 }
 
 func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
-	var sb strings.Builder
-	sb.WriteString("**System Alert**\n\n")
+	// Merge duplicate alerts
+	uniqueAlerts := make(map[string]struct{})
+	var uniqueList []Alert
 	for _, alert := range alerts {
-		sb.WriteString(alert.Message + "\n")
+		if _, exists := uniqueAlerts[alert.Message]; !exists {
+			uniqueAlerts[alert.Message] = struct{}{}
+			uniqueList = append(uniqueList, alert)
+		}
 	}
 
-	// Log the message for debugging
+	var sb strings.Builder
+	sb.WriteString("**System Alert**\n\n")
+	for _, alert := range uniqueList {
+		sb.WriteString(fmt.Sprintf("`%s`\n\n", alert.Message))
+	}
+
 	log.Printf("Sending Telegram message: %s", sb.String())
 
 	type TelegramMessage struct {
