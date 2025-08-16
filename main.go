@@ -105,70 +105,71 @@ func checkAll(config Config) []Alert {
 	// Check CPU
 	cpuUsage, err := getCPUUsage()
 	if err == nil && cpuUsage > config.CPUThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**CPU Usage Abnormal:** %.2f%% (threshold: %.2f%%)", cpuUsage, config.CPUThreshold)})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**CPU使用率异常:** %.2f%% (阈值: %.2f%%)", cpuUsage, config.CPUThreshold)})
 	}
 
 	// Check Memory
 	memFreePercent, err := getMemFreePercent()
 	if err == nil && memFreePercent < config.MemThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**Memory Free Abnormal:** %.2f%% (threshold: %.2f%%)", memFreePercent, config.MemThreshold)})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**内存空闲异常:** %.2f%% (阈值: %.2f%%)", memFreePercent, config.MemThreshold)})
 	}
 
 	// Check Network IO
 	netIO, err := getNetIO()
 	if err == nil && netIO > config.NetIOThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**Network IO Abnormal:** %d bytes/sec (threshold: %d)", netIO, config.NetIOThreshold)})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**网络IO异常:** %d bytes/sec (阈值: %d)", netIO, config.NetIOThreshold)})
 	}
 
 	// Check Disk IO
 	diskIO, err := getDiskIO()
 	if err == nil && diskIO > config.DiskIOThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**Disk IO Abnormal:** %d bytes/sec (threshold: %d)", diskIO, config.DiskIOThreshold)})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**磁盘IO异常:** %d bytes/sec (阈值: %d)", diskIO, config.DiskIOThreshold)})
 	}
 
 	// Check Disk Usage
 	diskUsage, err := getDiskUsage("/")
 	if err == nil && diskUsage > config.DiskUsageThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**Disk Usage Abnormal:** %.2f%% (threshold: %.2f%%)", diskUsage, config.DiskUsageThreshold)})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**磁盘使用率异常:** %.2f%% (阈值: %.2f%%)", diskUsage, config.DiskUsageThreshold)})
 	}
 
 	// MySQL checks
 	db, err := sql.Open("mysql", config.MySQLDSN)
 	if err != nil {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Connection Failed:** %s", sanitizeMarkdown(err.Error()))})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL连接失败:** %s", sanitizeMarkdown(err.Error()))})
 		return alerts
 	}
 	defer db.Close()
 
 	// Check if running
 	if err := db.Ping(); err != nil {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Not Running:** %s", sanitizeMarkdown(err.Error()))})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL未运行:** %s", sanitizeMarkdown(err.Error()))})
 	}
 
 	// Check slave status
 	slaveStatus, err := checkSlaveStatus(db)
 	if err == nil && (slaveStatus["Slave_IO_Running"] != "Yes" || slaveStatus["Slave_SQL_Running"] != "Yes") {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Slave Abnormal:** IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL从库异常:** IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))})
 	}
 
 	// Check deadlocks
 	deadlocks, err := checkDeadlocks(db)
 	if err == nil && deadlocks > 0 {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL Deadlocks Detected:** %d", deadlocks)})
+		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL检测到死锁:** %d", deadlocks)})
 	}
 
 	// Check slow queries
 	slowQueries, err := checkSlowQueries(db)
 	if err == nil && slowQueries > config.SlowQueryThreshold {
-		alertMsg := fmt.Sprintf("**MySQL Slow Queries:** %d (threshold: %d)", slowQueries, config.SlowQueryThreshold)
+		alertMsg := fmt.Sprintf("**MySQL慢查询异常:** %d (阈值: %d)", slowQueries, config.SlowQueryThreshold)
 		topSlowSQLs, err := getTopSlowQueries(config.SlowQueryLogPath)
 		if err == nil && len(topSlowSQLs) > 0 {
-			alertMsg += "\n**Top 3 Slowest SQL:**\n"
+			alertMsg += "\n**最慢的3条SQL:**\n"
 			for i, query := range topSlowSQLs {
-				alertMsg += fmt.Sprintf("%d. Time: %.2fs\n   SQL: `%s`\n", i+1, query.QueryTime, sanitizeMarkdown(query.SQLText))
+				formattedSQL := formatSQL(query.SQLText)
+				alertMsg += fmt.Sprintf("%d. 执行时间: %.3fs\n   SQL:\n```sql\n%s\n```\n", i+1, query.QueryTime, formattedSQL)
 			}
 		} else if err != nil {
-			alertMsg += fmt.Sprintf("\n**Slow Query Log Error:** %s", sanitizeMarkdown(err.Error()))
+			alertMsg += fmt.Sprintf("\n**慢查询日志错误:** %s", sanitizeMarkdown(err.Error()))
 		}
 		alerts = append(alerts, Alert{Message: alertMsg})
 	}
@@ -308,8 +309,9 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 	var queries []SlowQuery
 	var currentQuery strings.Builder
 	var queryTime float64
-	queryTimeRegex := regexp.MustCompile(`# Time:.*?\n# User@Host:.*?\n# Query_time: (\d+\.\d+).*?\n`)
-	sqlStartRegex := regexp.MustCompile(`^(SELECT|INSERT|UPDATE|DELETE|SET|ALTER|CREATE|DROP|TRUNCATE).*`)
+	queryTimeRegex := regexp.MustCompile(`# Query_time: (\d+\.\d+).*?\n`)
+	sqlStartRegex := regexp.MustCompile(`^(SELECT|INSERT|UPDATE|DELETE|ALTER|CREATE|DROP|TRUNCATE).*`)
+	nonSQLRegex := regexp.MustCompile(`^(use |SET |throttle:).*`)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -330,8 +332,8 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 				currentQuery.Reset()
 			}
 			currentQuery.WriteString(line + "\n")
-		} else if currentQuery.Len() > 0 {
-			// Continue building current query
+		} else if !nonSQLRegex.MatchString(line) && currentQuery.Len() > 0 {
+			// Continue building current query, excluding non-SQL lines
 			currentQuery.WriteString(line + "\n")
 		}
 	}
@@ -364,6 +366,26 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 	return queries, nil
 }
 
+// formatSQL formats SQL text for better readability
+func formatSQL(sql string) string {
+	// Remove extra newlines and trim
+	sql = strings.TrimSpace(sql)
+	// Split into lines and format
+	lines := strings.Split(sql, "\n")
+	var formatted []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			// Add indentation for non-first lines
+			if len(formatted) > 0 {
+				trimmed = "  " + trimmed
+			}
+			formatted = append(formatted, trimmed)
+		}
+	}
+	return strings.Join(formatted, "\n")
+}
+
 // sanitizeMarkdown escapes special Markdown characters to prevent parsing errors
 func sanitizeMarkdown(s string) string {
 	specialChars := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
@@ -385,7 +407,7 @@ func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("**System Alert**\n\n")
+	sb.WriteString("**系统告警**\n\n")
 	for _, alert := range uniqueList {
 		sb.WriteString(fmt.Sprintf("`%s`\n\n", alert.Message))
 	}
