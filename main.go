@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -46,6 +48,26 @@ type SlowQuery struct {
 	QueryTime float64
 }
 
+type AlertTracker struct {
+	sync.Mutex
+	lastSent map[string]time.Time
+}
+
+func (at *AlertTracker) CanSend(message string, now time.Time) bool {
+	at.Lock()
+	defer at.Unlock()
+	last, exists := at.lastSent[message]
+	if !exists || now.Sub(last) >= 15*time.Minute {
+		at.lastSent[message] = now
+		return true
+	}
+	return false
+}
+
+var alertTracker = &AlertTracker{
+	lastSent: make(map[string]time.Time),
+}
+
 func main() {
 	// Load configuration from file
 	config, err := loadConfig()
@@ -66,7 +88,7 @@ func main() {
 	for range ticker.C {
 		alerts := checkAll(config)
 		if len(alerts) > 0 {
-			sendTelegramAlert(alerts, config.TelegramToken, config.TelegramChatID)
+			sendTelegramAlert(alerts, config)
 		}
 	}
 }
@@ -101,77 +123,109 @@ func loadConfig() (Config, error) {
 
 func checkAll(config Config) []Alert {
 	var alerts []Alert
+	now := time.Now()
 
 	// Check CPU
 	cpuUsage, err := getCPUUsage()
 	if err == nil && cpuUsage > config.CPUThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**CPU使用率异常:** %.2f%% (阈值: %.2f%%)", cpuUsage, config.CPUThreshold)})
+		message := fmt.Sprintf("**CPU使用率异常:** %.2f%% (阈值: %.2f%%)", cpuUsage, config.CPUThreshold)
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check Memory
 	memFreePercent, err := getMemFreePercent()
 	if err == nil && memFreePercent < config.MemThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**内存空闲异常:** %.2f%% (阈值: %.2f%%)", memFreePercent, config.MemThreshold)})
+		message := fmt.Sprintf("**内存空闲异常:** %.2f%% (阈值: %.2f%%)", memFreePercent, config.MemThreshold)
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check Network IO
 	netIO, err := getNetIO()
 	if err == nil && netIO > config.NetIOThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**网络IO异常:** %d bytes/sec (阈值: %d)", netIO, config.NetIOThreshold)})
+		message := fmt.Sprintf("**网络IO异常:** %d bytes/sec (阈值: %d)", netIO, config.NetIOThreshold)
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check Disk IO
 	diskIO, err := getDiskIO()
 	if err == nil && diskIO > config.DiskIOThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**磁盘IO异常:** %d bytes/sec (阈值: %d)", diskIO, config.DiskIOThreshold)})
+		message := fmt.Sprintf("**磁盘IO异常:** %d bytes/sec (阈值: %d)", diskIO, config.DiskIOThreshold)
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check Disk Usage
 	diskUsage, err := getDiskUsage("/")
 	if err == nil && diskUsage > config.DiskUsageThreshold {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**磁盘使用率异常:** %.2f%% (阈值: %.2f%%)", diskUsage, config.DiskUsageThreshold)})
+		message := fmt.Sprintf("**磁盘使用率异常:** %.2f%% (阈值: %.2f%%)", diskUsage, config.DiskUsageThreshold)
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// MySQL checks
 	db, err := sql.Open("mysql", config.MySQLDSN)
 	if err != nil {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL连接失败:** %s", sanitizeMarkdown(err.Error()))})
+		message := fmt.Sprintf("**MySQL连接失败:** %s", sanitizeMarkdown(err.Error()))
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 		return alerts
 	}
 	defer db.Close()
 
 	// Check if running
 	if err := db.Ping(); err != nil {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL未运行:** %s", sanitizeMarkdown(err.Error()))})
+		message := fmt.Sprintf("**MySQL未运行:** %s", sanitizeMarkdown(err.Error()))
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check slave status
 	slaveStatus, err := checkSlaveStatus(db)
 	if err == nil && (slaveStatus["Slave_IO_Running"] != "Yes" || slaveStatus["Slave_SQL_Running"] != "Yes") {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL从库异常:** IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))})
+		message := fmt.Sprintf("**MySQL从库异常:** IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check deadlocks
 	deadlocks, err := checkDeadlocks(db)
 	if err == nil && deadlocks > 0 {
-		alerts = append(alerts, Alert{Message: fmt.Sprintf("**MySQL检测到死锁:** %d", deadlocks)})
+		message := fmt.Sprintf("**MySQL检测到死锁:** %d", deadlocks)
+		if alertTracker.CanSend(message, now) {
+			alerts = append(alerts, Alert{Message: message})
+		}
 	}
 
 	// Check slow queries
 	slowQueries, err := checkSlowQueries(db)
 	if err == nil && slowQueries > config.SlowQueryThreshold {
-		alertMsg := fmt.Sprintf("**MySQL慢查询异常:** %d (阈值: %d)", slowQueries, config.SlowQueryThreshold)
-		topSlowSQLs, err := getTopSlowQueries(config.SlowQueryLogPath)
-		if err == nil && len(topSlowSQLs) > 0 {
-			alertMsg += "\n**最慢的3条SQL:**\n"
-			for i, query := range topSlowSQLs {
-				formattedSQL := formatSQL(query.SQLText)
-				alertMsg += fmt.Sprintf("%d. 执行时间: %.3fs\n   SQL:\n```sql\n%s\n```\n", i+1, query.QueryTime, formattedSQL)
+		filename := fmt.Sprintf("slow_queries_%s.txt", time.Now().Format("20060102150405"))
+		message := fmt.Sprintf("**MySQL慢查询异常:** %d (阈值: %d)\n慢查询详情见附件 %s", slowQueries, config.SlowQueryThreshold, filename)
+		if alertTracker.CanSend(message, now) {
+			alertMsg := message
+			topSlowSQLs, err := getTopSlowQueries(config.SlowQueryLogPath)
+			if err == nil && len(topSlowSQLs) > 0 {
+				// Save top 5 queries to file
+				err = saveSlowQueriesToFile(topSlowSQLs, filename)
+				if err != nil {
+					alertMsg += fmt.Sprintf("\n**保存慢查询文件错误:** %s", sanitizeMarkdown(err.Error()))
+				}
+			} else if err != nil {
+				alertMsg += fmt.Sprintf("\n**慢查询日志错误:** %s", sanitizeMarkdown(err.Error()))
 			}
-		} else if err != nil {
-			alertMsg += fmt.Sprintf("\n**慢查询日志错误:** %s", sanitizeMarkdown(err.Error()))
+			alerts = append(alerts, Alert{Message: alertMsg})
 		}
-		alerts = append(alerts, Alert{Message: alertMsg})
 	}
 
 	return alerts
@@ -302,7 +356,7 @@ func checkSlowQueries(db *sql.DB) (int, error) {
 func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 	file, err := os.Open(logPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open slow query log: %w", err)
+		return nil, fmt.Errorf("无法打开慢查询日志: %w", err)
 	}
 	defer file.Close()
 
@@ -316,11 +370,13 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+		log.Printf("Parsing slow query log line: %s", line)
 		if queryTimeRegex.MatchString(line) {
 			// Extract query time
 			matches := queryTimeRegex.FindStringSubmatch(line)
 			if len(matches) > 1 {
 				queryTime, _ = strconv.ParseFloat(matches[1], 64)
+				log.Printf("Parsed Query_time: %.3f", queryTime)
 			}
 		} else if sqlStartRegex.MatchString(line) {
 			// Save previous query if exists
@@ -329,6 +385,7 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 					SQLText:   strings.TrimSpace(currentQuery.String()),
 					QueryTime: queryTime,
 				})
+				log.Printf("Added query: %s, Time: %.3f", currentQuery.String(), queryTime)
 				currentQuery.Reset()
 			}
 			currentQuery.WriteString(line + "\n")
@@ -344,13 +401,14 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 			SQLText:   strings.TrimSpace(currentQuery.String()),
 			QueryTime: queryTime,
 		})
+		log.Printf("Added final query: %s, Time: %.3f", currentQuery.String(), queryTime)
 	}
 
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading slow query log: %w", err)
+		return nil, fmt.Errorf("读取慢查询日志错误: %w", err)
 	}
 
-	// Sort queries by query time (descending) and take top 3
+	// Sort queries by query time (descending) and take top 5
 	for i := 0; i < len(queries)-1; i++ {
 		for j := i + 1; j < len(queries); j++ {
 			if queries[i].QueryTime < queries[j].QueryTime {
@@ -359,11 +417,32 @@ func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
 		}
 	}
 
-	if len(queries) > 3 {
-		queries = queries[:3]
+	if len(queries) > 5 {
+		queries = queries[:5]
 	}
 
+	log.Printf("Top queries: %+v", queries)
 	return queries, nil
+}
+
+func saveSlowQueriesToFile(queries []SlowQuery, filename string) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("无法创建慢查询文件: %w", err)
+	}
+	defer file.Close()
+
+	writer := bufio.NewWriter(file)
+	for i, query := range queries {
+		_, err := writer.WriteString(fmt.Sprintf("Query %d: (执行时间: %.3fs)\n%s\n\n", i+1, query.QueryTime, formatSQL(query.SQLText)))
+		if err != nil {
+			return fmt.Errorf("写入慢查询文件错误: %w", err)
+		}
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("刷新慢查询文件错误: %w", err)
+	}
+	return nil
 }
 
 // formatSQL formats SQL text for better readability
@@ -380,10 +459,19 @@ func formatSQL(sql string) string {
 			if len(formatted) > 0 {
 				trimmed = "  " + trimmed
 			}
+			// Truncate long lines to avoid Telegram message size limit
+			if len(trimmed) > 1000 {
+				trimmed = trimmed[:1000] + "..."
+			}
 			formatted = append(formatted, trimmed)
 		}
 	}
-	return strings.Join(formatted, "\n")
+	formattedSQL := strings.Join(formatted, "\n")
+	// Ensure file size is manageable (Telegram limit: 50MB)
+	if len(formattedSQL) > 1000000 {
+		formattedSQL = formattedSQL[:1000000] + "..."
+	}
+	return formattedSQL
 }
 
 // sanitizeMarkdown escapes special Markdown characters to prevent parsing errors
@@ -392,10 +480,14 @@ func sanitizeMarkdown(s string) string {
 	for _, char := range specialChars {
 		s = strings.ReplaceAll(s, char, "\\"+char)
 	}
+	// Additional escaping for quotes and backticks to handle SQL edge cases
+	s = strings.ReplaceAll(s, "'", "\\'")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "`", "\\`")
 	return s
 }
 
-func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
+func sendTelegramAlert(alerts []Alert, config Config) {
 	// Merge duplicate alerts
 	uniqueAlerts := make(map[string]struct{})
 	var uniqueList []Alert
@@ -412,30 +504,62 @@ func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
 		sb.WriteString(fmt.Sprintf("`%s`\n\n", alert.Message))
 	}
 
-	log.Printf("Sending Telegram message: %s", sb.String())
+	message := sb.String()
+	log.Printf("Sending Telegram message (length: %d bytes): %s", len(message), message)
 
-	type TelegramMessage struct {
-		ChatID    string `json:"chat_id"`
-		Text      string `json:"text"`
-		ParseMode string `json:"parse_mode"`
-	}
+	// Prepare form data for file upload
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
 
-	msg := TelegramMessage{
-		ChatID:    telegramChatID,
-		Text:      sb.String(),
-		ParseMode: "Markdown",
-	}
-
-	body, err := json.Marshal(msg)
+	// Add text message
+	err := writer.WriteField("chat_id", config.TelegramChatID)
 	if err != nil {
-		log.Printf("Failed to marshal Telegram message: %v", err)
+		log.Printf("Failed to add chat_id to form: %v", err)
+		return
+	}
+	err = writer.WriteField("text", message)
+	if err != nil {
+		log.Printf("Failed to add text to form: %v", err)
+		return
+	}
+	err = writer.WriteField("parse_mode", "Markdown")
+	if err != nil {
+		log.Printf("Failed to add parse_mode to form: %v", err)
 		return
 	}
 
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", telegramToken)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	// Add slow_queries_YYYYMMDDHHMMSS.txt if it exists
+	filename := fmt.Sprintf("slow_queries_%s.txt", time.Now().Format("20060102150405"))
+	if _, err := os.Stat(filename); err == nil {
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Printf("Failed to open %s: %v", filename, err)
+			return
+		}
+		defer file.Close()
+
+		part, err := writer.CreateFormFile("document", filename)
+		if err != nil {
+			log.Printf("Failed to create form file: %v", err)
+			return
+		}
+		_, err = io.Copy(part, file)
+		if err != nil {
+			log.Printf("Failed to copy file to form: %v", err)
+			return
+		}
+	}
+
+	err = writer.Close()
 	if err != nil {
-		log.Printf("Failed to send alert: %v", err)
+		log.Printf("Failed to close form writer: %v", err)
+		return
+	}
+
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/sendDocument", config.TelegramToken)
+	resp, err := http.Post(url, writer.FormDataContentType(), body)
+	if err != nil {
+		log.Printf("Failed to send Telegram document: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -443,5 +567,10 @@ func sendTelegramAlert(alerts []Alert, telegramToken, telegramChatID string) {
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		log.Printf("Telegram error: %s", string(bodyBytes))
+	}
+
+	// Clean up slow_queries_YYYYMMDDHHMMSS.txt
+	if err := os.Remove(filename); err != nil {
+		log.Printf("Failed to remove %s: %v", filename, err)
 	}
 }
