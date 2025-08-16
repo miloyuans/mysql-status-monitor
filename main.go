@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
