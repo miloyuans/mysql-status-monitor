@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,9 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,10 +34,16 @@ type Config struct {
 	DiskIOThreshold    uint64  `mapstructure:"disk_io_threshold"`
 	DiskUsageThreshold float64 `mapstructure:"disk_usage_threshold"`
 	SlowQueryThreshold int     `mapstructure:"slow_query_threshold"`
+	SlowQueryLogPath   string  `mapstructure:"slow_query_log_path"`
 }
 
 type Alert struct {
 	Message string
+}
+
+type SlowQuery struct {
+	SQLText   string
+	QueryTime float64
 }
 
 func main() {
@@ -76,6 +86,7 @@ func loadConfig() (Config, error) {
 	viper.SetDefault("disk_io_threshold", 50000000)  // 50MB/s
 	viper.SetDefault("disk_usage_threshold", 80.0)
 	viper.SetDefault("slow_query_threshold", 1)
+	viper.SetDefault("slow_query_log_path", "/var/log/mysql/mysql-slow.log")
 
 	if err := viper.ReadInConfig(); err != nil {
 		return config, fmt.Errorf("error reading config file: %w", err)
@@ -150,12 +161,14 @@ func checkAll(config Config) []Alert {
 	slowQueries, err := checkSlowQueries(db)
 	if err == nil && slowQueries > config.SlowQueryThreshold {
 		alertMsg := fmt.Sprintf("**MySQL Slow Queries:** %d (threshold: %d)", slowQueries, config.SlowQueryThreshold)
-		topSlowSQLs, err := getTopSlowQueries(db)
+		topSlowSQLs, err := getTopSlowQueries(config.SlowQueryLogPath)
 		if err == nil && len(topSlowSQLs) > 0 {
-			alertMsg += "\nTop 3 Slowest SQL:\n"
-			for i, sql := range topSlowSQLs {
-				alertMsg += fmt.Sprintf("%d. %s\n", i+1, sanitizeMarkdown(sql))
+			alertMsg += "\n**Top 3 Slowest SQL:**\n"
+			for i, query := range topSlowSQLs {
+				alertMsg += fmt.Sprintf("%d. Time: %.2fs\n   SQL: `%s`\n", i+1, query.QueryTime, sanitizeMarkdown(query.SQLText))
 			}
+		} else if err != nil {
+			alertMsg += fmt.Sprintf("\n**Slow Query Log Error:** %s", sanitizeMarkdown(err.Error()))
 		}
 		alerts = append(alerts, Alert{Message: alertMsg})
 	}
@@ -285,23 +298,70 @@ func checkSlowQueries(db *sql.DB) (int, error) {
 	return slowQueries, nil
 }
 
-func getTopSlowQueries(db *sql.DB) ([]string, error) {
-	rows, err := db.Query("SELECT sql_text, query_time FROM mysql.slow_log ORDER BY query_time DESC LIMIT 3")
+func getTopSlowQueries(logPath string) ([]SlowQuery, error) {
+	file, err := os.Open(logPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open slow query log: %w", err)
 	}
-	defer rows.Close()
+	defer file.Close()
 
-	var topSQLs []string
-	for rows.Next() {
-		var sqlText string
-		var queryTime float64
-		if err := rows.Scan(&sqlText, &queryTime); err != nil {
-			return nil, err
+	var queries []SlowQuery
+	var currentQuery strings.Builder
+	var queryTime float64
+	queryTimeRegex := regexp.MustCompile(`# Time:.*?\n# User@Host:.*?\n# Query_time: (\d+\.\d+).*?\n`)
+	sqlStartRegex := regexp.MustCompile(`^(SELECT|INSERT|UPDATE|DELETE|SET|ALTER|CREATE|DROP|TRUNCATE).*`)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if queryTimeRegex.MatchString(line) {
+			// Extract query time
+			matches := queryTimeRegex.FindStringSubmatch(line)
+			if len(matches) > 1 {
+				queryTime, _ = strconv.ParseFloat(matches[1], 64)
+			}
+		} else if sqlStartRegex.MatchString(line) {
+			// Save previous query if exists
+			if currentQuery.Len() > 0 {
+				queries = append(queries, SlowQuery{
+					SQLText:   strings.TrimSpace(currentQuery.String()),
+					QueryTime: queryTime,
+				})
+				currentQuery.Reset()
+			}
+			currentQuery.WriteString(line + "\n")
+		} else if currentQuery.Len() > 0 {
+			// Continue building current query
+			currentQuery.WriteString(line + "\n")
 		}
-		topSQLs = append(topSQLs, fmt.Sprintf("SQL: %s, Time: %.2fs", sqlText, queryTime))
 	}
-	return topSQLs, rows.Err()
+
+	// Add the last query
+	if currentQuery.Len() > 0 {
+		queries = append(queries, SlowQuery{
+			SQLText:   strings.TrimSpace(currentQuery.String()),
+			QueryTime: queryTime,
+		})
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading slow query log: %w", err)
+	}
+
+	// Sort queries by query time (descending) and take top 3
+	for i := 0; i < len(queries)-1; i++ {
+		for j := i + 1; j < len(queries); j++ {
+			if queries[i].QueryTime < queries[j].QueryTime {
+				queries[i], queries[j] = queries[j], queries[i]
+			}
+		}
+	}
+
+	if len(queries) > 3 {
+		queries = queries[:3]
+	}
+
+	return queries, nil
 }
 
 // sanitizeMarkdown escapes special Markdown characters to prevent parsing errors
