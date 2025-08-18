@@ -32,13 +32,14 @@ type Config struct {
 	MonitorInterval    string  `mapstructure:"monitor_interval"`
 	CPUThreshold       float64 `mapstructure:"cpu_threshold"`
 	MemThreshold       float64 `mapstructure:"mem_threshold"`
-	NetIOThreshold     float64 `mapstructure:"net_io_threshold"`  // Changed to float64 for GB/s
-	DiskIOThreshold    float64 `mapstructure:"disk_io_threshold"` // Changed to float64 for GB/s
+	NetIOThreshold     float64 `mapstructure:"net_io_threshold"`
+	DiskIOThreshold    float64 `mapstructure:"disk_io_threshold"`
 	DiskUsageThreshold float64 `mapstructure:"disk_usage_threshold"`
 	SlowQueryThreshold int     `mapstructure:"slow_query_threshold"`
 	SlowQueryLogPath   string  `mapstructure:"slow_query_log_path"`
 	SlowQueryFilePath  string  `mapstructure:"slow_query_file_path"`
 	ClusterName        string  `mapstructure:"cluster_name"`
+	EnableSlaveCheck   bool    `mapstructure:"enable_slave_check"`
 }
 
 type Alert struct {
@@ -121,6 +122,7 @@ func loadConfig() (Config, error) {
 	viper.SetDefault("slow_query_log_path", "/var/log/mysql/mysql-slow.log")
 	viper.SetDefault("slow_query_file_path", "/var/log/system-monitor/")
 	viper.SetDefault("cluster_name", "")
+	viper.SetDefault("enable_slave_check", true)
 
 	if err := viper.ReadInConfig(); err != nil {
 		return config, fmt.Errorf("error reading config file: %w", err)
@@ -230,12 +232,20 @@ func checkAll(config Config) []Alert {
 	}
 
 	// Check slave status
-	slaveStatus, err := checkSlaveStatus(db)
-	slaveStatusStr := "正常"
-	if err == nil && (slaveStatus["Slave_IO_Running"] != "Yes" || slaveStatus["Slave_SQL_Running"] != "Yes") {
-		slaveStatusStr = fmt.Sprintf("异常: IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))
-	} else if err != nil {
-		slaveStatusStr = fmt.Sprintf("错误: %s", sanitizeMarkdown(err.Error()))
+	slaveStatusStr := "未启用"
+	if config.EnableSlaveCheck {
+		slaveStatus, err := checkSlaveStatus(db)
+		if err == nil {
+			if len(slaveStatus) == 0 {
+				slaveStatusStr = "非从库"
+			} else if slaveStatus["Slave_IO_Running"] != "Yes" || slaveStatus["Slave_SQL_Running"] != "Yes" {
+				slaveStatusStr = fmt.Sprintf("异常: IO: %s, SQL: %s", sanitizeMarkdown(slaveStatus["Slave_IO_Running"]), sanitizeMarkdown(slaveStatus["Slave_SQL_Running"]))
+			} else {
+				slaveStatusStr = "正常"
+			}
+		} else {
+			slaveStatusStr = fmt.Sprintf("错误: %s", sanitizeMarkdown(err.Error()))
+		}
 	}
 	alertMsg.WriteString(fmt.Sprintf("**数据库主从状态**: %s\n", slaveStatusStr))
 
@@ -299,7 +309,7 @@ func checkAll(config Config) []Alert {
 	// Send alert if there are issues
 	message := alertMsg.String()
 	if cpuStatus != "正常" || memStatus != "正常" || netIOStatus != "正常" || diskIOStatus != "正常" || diskUsageStatus != "正常" ||
-		slaveStatusStr != "正常" || deadlockStatus != "正常" || slowQueryStatus != "正常" {
+		(slaveStatusStr != "正常" && slaveStatusStr != "未启用" && slaveStatusStr != "非从库") || deadlockStatus != "正常" || slowQueryStatus != "正常" {
 		if alertTracker.CanSend(message, now) {
 			alerts = append(alerts, Alert{Message: message, Filename: filename})
 		}
@@ -379,17 +389,17 @@ func getDiskUsage(path string) (float64, error) {
 func checkSlaveStatus(db *sql.DB) (map[string]string, error) {
 	rows, err := db.Query("SHOW SLAVE STATUS")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("查询主从状态失败: %w", err)
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("获取列信息失败: %w", err)
 	}
 
 	if !rows.Next() {
-		return nil, fmt.Errorf("no slave status")
+		return make(map[string]string), nil // Return empty map for non-replica server
 	}
 
 	values := make([]interface{}, len(cols))
@@ -400,7 +410,7 @@ func checkSlaveStatus(db *sql.DB) (map[string]string, error) {
 
 	err = rows.Scan(valuePtrs...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("扫描行数据失败: %w", err)
 	}
 
 	status := make(map[string]string)
